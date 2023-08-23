@@ -17,10 +17,12 @@ import sys
 import collections
 import copy
 import importlib
+import types
 import warnings
 import numbers
 from itertools import zip_longest
 from abc import ABC, abstractmethod
+from typing import Dict
 
 
 try:
@@ -29,12 +31,12 @@ except ImportError:
     from Bio import MissingPythonDependencyError
 
     raise MissingPythonDependencyError(
-        "Please install numpy if you want to use Bio.Align. "
+        "Please install NumPy if you want to use Bio.Align. "
         "See http://www.numpy.org/"
     ) from None
 
 from Bio import BiopythonDeprecationWarning
-from Bio.Align import _aligners
+from Bio.Align import _aligners  # type: ignore
 from Bio.Align import substitution_matrices
 from Bio.Seq import Seq, MutableSeq, reverse_complement, UndefinedSequenceError
 from Bio.SeqRecord import SeqRecord, _RestrictedDict
@@ -630,7 +632,7 @@ class MultipleSeqAlignment:
         if len(self) != len(other):
             raise ValueError(
                 "When adding two alignments they must have the same length"
-                " (i.e. same number or rows)"
+                " (i.e. same number of rows)"
             )
         merged = (left + right for left, right in zip(self, other))
         # Take any common annotation:
@@ -953,6 +955,27 @@ class MultipleSeqAlignment:
 
         return m
 
+    @property
+    def alignment(self):
+        """Return an Alignment object based on the MultipleSeqAlignment object.
+
+        This makes a copy of each SeqRecord with a gap-less sequence. Any
+        future changes to the original records in the MultipleSeqAlignment will
+        not affect the new records in the Alignment.
+        """
+        records = [copy.copy(record) for record in self._records]
+        if records:
+            lines = [str(record.seq) for record in records]
+            coordinates = Alignment.infer_coordinates(lines)
+            for record in records:
+                record.seq = record.seq.replace("-", "")
+            alignment = Alignment(records, coordinates)
+        else:
+            alignment = Alignment([])
+        alignment.annotations = self.annotations
+        alignment.column_annotations = self.column_annotations
+        return alignment
+
 
 class Alignment:
     """Represents a sequence alignment.
@@ -960,7 +983,7 @@ class Alignment:
     An Alignment object has a `.sequences` attribute storing the sequences
     (Seq, MutableSeq, SeqRecord, or string objects) that were aligned, as well
     as a `.coordinates` attribute storing the sequence coordinates defining the
-    alignment as a numpy array.
+    alignment as a NumPy array.
 
     Other commonly used attributes (which may or may not be present) are:
          - annotations        - A dictionary with annotations describing the
@@ -980,7 +1003,7 @@ class Alignment:
         For an alignment consisting of N sequences, printed as N lines with
         the same number of columns, where gaps are represented by dashes,
         this method will calculate the sequence coordinates that define the
-        alignment. The coordinates are returned as a numpy array of integers,
+        alignment. The coordinates are returned as a NumPy array of integers,
         and can be used to create an Alignment object.
 
         The argument skipped columns should be None (the default) or an empty
@@ -1114,6 +1137,134 @@ class Alignment:
         if dtype is not None:
             data = np.array(data, dtype)
         return data
+
+    def __add__(self, other):
+        """Combine two alignments by adding them row-wise.
+
+        For example,
+
+        >>> import numpy as np
+        >>> from Bio.Seq import Seq
+        >>> from Bio.SeqRecord import SeqRecord
+        >>> from Bio.Align import Alignment
+        >>> a1 = SeqRecord(Seq("AAAAC"), id="Alpha")
+        >>> b1 = SeqRecord(Seq("AAAC"), id="Beta")
+        >>> c1 = SeqRecord(Seq("AAAAG"), id="Gamma")
+        >>> a2 = SeqRecord(Seq("GTT"), id="Alpha")
+        >>> b2 = SeqRecord(Seq("TT"), id="Beta")
+        >>> c2 = SeqRecord(Seq("GT"), id="Gamma")
+        >>> left = Alignment([a1, b1, c1],
+        ...                  coordinates=np.array([[0, 3, 4, 5],
+        ...                                        [0, 3, 3, 4],
+        ...                                        [0, 3, 4, 5]]))
+        >>> left.annotations = {"tool": "demo", "name": "start"}
+        >>> left.column_annotations = {"stats": "CCCXC"}
+        >>> right = Alignment([a2, b2, c2],
+        ...                   coordinates=np.array([[0, 1, 2, 3],
+        ...                                         [0, 0, 1, 2],
+        ...                                         [0, 1, 1, 2]]))
+        >>> right.annotations = {"tool": "demo", "name": "end"}
+        >>> right.column_annotations = {"stats": "CXC"}
+
+        Now, let's look at these two alignments:
+
+        >>> print(left)
+        Alpha             0 AAAAC 5
+        Beta              0 AAA-C 4
+        Gamma             0 AAAAG 5
+        <BLANKLINE>
+        >>> print(right)
+        Alpha             0 GTT 3
+        Beta              0 -TT 2
+        Gamma             0 G-T 2
+        <BLANKLINE>
+
+        And add them:
+
+        >>> combined = left + right
+        >>> print(combined)
+        Alpha             0 AAAACGTT 8
+        Beta              0 AAA-C-TT 6
+        Gamma             0 AAAAGG-T 7
+        <BLANKLINE>
+
+        For this to work, both alignments must have the same number of sequences
+        (here they both have 3 rows):
+
+        >>> len(left)
+        3
+        >>> len(right)
+        3
+        >>> len(combined)
+        3
+
+        The sequences are SeqRecord objects, and these can be added together. Refer
+        to the SeqRecord documentation for details of how the annotation is handled. This
+        example is a special case in that both original alignments shared the same names,
+        meaning when the rows are added they also get the same name.
+
+        Any common annotations are preserved, but differing annotation is lost. This is
+        the same behavior used in the SeqRecord annotations and is designed to prevent
+        accidental propagation of inappropriate values:
+
+        >>> combined.annotations
+        {'tool': 'demo'}
+
+        Similarly any common per-column-annotations are combined:
+
+        >>> combined.column_annotations
+        {'stats': 'CCCXCCXC'}
+
+        """
+        if not isinstance(other, Alignment):
+            raise NotImplementedError
+        if len(self) != len(other):
+            raise ValueError(
+                "When adding two alignments they must have the same length"
+                " (i.e. same number of rows)"
+            )
+        starts1 = self.coordinates[:, 0]
+        ends1 = self.coordinates[:, -1]
+        sequences1 = self.sequences
+        starts2 = other.coordinates[:, 0]
+        ends2 = other.coordinates[:, -1]
+        sequences2 = other.sequences
+        sequences = []
+        for start1, end1, seq1, start2, end2, seq2 in zip(
+            starts1, ends1, sequences1, starts2, ends2, sequences2
+        ):
+            sequence = seq1[start1:end1] + seq2[start2:end2]
+            sequences.append(sequence)
+        offset = starts2 - ends1 + starts1
+        coordinates1 = self.coordinates - starts1[:, None]
+        coordinates2 = other.coordinates - offset[:, None]
+        coordinates = np.append(coordinates1, coordinates2, axis=1)
+        alignment = Alignment(sequences, coordinates)
+        # Take any common annotation:
+        annotations = {}
+        try:
+            for k, v in self.annotations.items():
+                try:
+                    if other.annotations[k] == v:
+                        annotations[k] = v
+                except KeyError:
+                    continue
+        except AttributeError:
+            pass
+        else:
+            alignment.annotations = annotations
+        column_annotations = {}
+        try:
+            for k, v in self.column_annotations.items():
+                try:
+                    column_annotations[k] = v + other.column_annotations[k]
+                except KeyError:
+                    continue
+        except AttributeError:
+            pass
+        else:
+            alignment.column_annotations = column_annotations
+        return alignment
 
     @property
     def frequencies(self):
@@ -1374,7 +1525,7 @@ class Alignment:
         """Return the path through the trace matrix."""
         warnings.warn(
             "The path attribute is deprecated; please use the coordinates "
-            "attribute instead. The coordinates attribute is a numpy array "
+            "attribute instead. The coordinates attribute is a NumPy array "
             "containing the same values as the path attributes, after "
             "transposition.",
             BiopythonDeprecationWarning,
@@ -1386,7 +1537,7 @@ class Alignment:
     def path(self, value):
         warnings.warn(
             "The path attribute is deprecated; please use the coordinates "
-            "attribute instead. The coordinates attribute is a numpy array "
+            "attribute instead. The coordinates attribute is a NumPy array "
             "containing the same values as the path attributes, after "
             "transposition.",
             BiopythonDeprecationWarning,
@@ -2693,7 +2844,7 @@ class Alignment:
     def indices(self):
         """Return the sequence index of each lettter in the alignment.
 
-        This property returns a 2D numpy array with the sequence index of each
+        This property returns a 2D NumPy array with the sequence index of each
         letter in the alignment. Gaps are indicated by -1.  The array has the
         same number of rows and columns as the alignment, as given by
         `self.shape`.
@@ -2779,7 +2930,7 @@ class Alignment:
     def inverse_indices(self):
         """Return the alignment column index for each letter in each sequence.
 
-        This property returns a list of 1D numpy arrays; the number of arrays
+        This property returns a list of 1D NumPy arrays; the number of arrays
         is equal to the number of aligned sequences, and the length of each
         array is equal to the length of the corresponding sequence. For each
         letter in each sequence, the array contains the corresponding column
@@ -3206,7 +3357,7 @@ class Alignment:
         return m
 
     def counts(self):
-        """Return number of identities, mismatches, and gaps, of a pairwise alignment.
+        """Return number of identities, mismatches, and gaps of a pairwise alignment.
 
         >>> aligner = PairwiseAligner(mode='global', match_score=2, mismatch_score=-1)
         >>> for alignment in aligner.align("TACCG", "ACG"):
@@ -3231,7 +3382,7 @@ class Alignment:
         This classifies each pair of letters in a pairwise alignment into gaps,
         perfect matches, or mismatches. It has been defined as a method (not a
         property) so that it may in future take optional argument(s) allowing
-        the behaviour to be customised. These three values are returned as a
+        the behavior to be customized. These three values are returned as a
         namedtuple. This is calculated for all the pairs of sequences in the
         alignment.
         """
@@ -3276,7 +3427,9 @@ class Alignment:
         >>> print(rc_alignment.column_annotations)
         {'score': [2, 2, 2, 3]}
         """
-        sequences = [reverse_complement(sequence) for sequence in self.sequences]
+        sequences = [
+            reverse_complement(sequence, inplace=False) for sequence in self.sequences
+        ]
         coordinates = np.array(
             [
                 len(sequence) - row[::-1]
@@ -3329,26 +3482,27 @@ class AlignmentsAbstractBaseClass(ABC):
 
 
 class Alignments(AlignmentsAbstractBaseClass, list):  # noqa: D101
-    def __init__(self):  # noqa: D107
-        super().__init__()
-        self._index = 0
+    def __init__(self, alignments=()):  # noqa: D107
+        super().__init__(alignments)
+        self._index = -1
 
     def __next__(self):
+        index = self._index + 1
         try:
-            item = self[self._index]
+            item = self[index]
         except IndexError:
             raise StopIteration
-        self._index += 1
+        self._index = index
         return item
 
     def rewind(self):  # noqa: D102
-        self._index = 0
+        self._index = -1
 
     def __len__(self):
         return list.__len__(self)
 
 
-class PairwiseAlignments:
+class PairwiseAlignments(AlignmentsAbstractBaseClass):
     """Implements an iterator over pairwise alignments returned by the aligner.
 
     This class also supports indexing, which is fast for increasing indices,
@@ -3381,6 +3535,10 @@ class PairwiseAlignments:
 
     def __len__(self):
         return len(self._paths)
+
+    def __iter__(self):
+        self.rewind()
+        return self
 
     def __getitem__(self, index):
         if not isinstance(index, int):
@@ -3703,7 +3861,7 @@ class PairwiseAlignment(Alignment):
         warnings.warn(
             "The PairwiseAlignment class is deprecated; please use the "
             "Alignment class instead.  Note that the coordinates attribute of "
-            "an Alignment object is a numpy array and the transpose of the "
+            "an Alignment object is a NumPy array and the transpose of the "
             "path attribute of a PairwiseAlignment object.",
             BiopythonDeprecationWarning,
             stacklevel=2,
@@ -3738,10 +3896,10 @@ formats = (
 )
 # fmt: on
 
-_modules = {}
+_modules: Dict[str, types.ModuleType] = {}
 
 
-def _load(fmt):
+def _load(fmt: str) -> types.ModuleType:
     fmt = fmt.lower()
     try:
         return _modules[fmt]
